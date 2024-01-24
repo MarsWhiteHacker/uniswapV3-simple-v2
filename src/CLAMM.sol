@@ -5,6 +5,8 @@ import "./lib/Tick.sol";
 import "./lib/TickMath.sol";
 import "./lib/Position.sol";
 import "./lib/SafeCast.sol";
+import "./lib/SwapMath.sol";
+import "./lib/TickBitmap.sol";
 import "./lib/SqrtPriceMath.sol";
 import "./interfaces/IERC20.sol";
 
@@ -16,6 +18,8 @@ function checkTicks(int24 tickLower, int24 tickUpper) pure {
 
 contract CLAMM {
     using Tick for mapping(int24 => Tick.Info);
+    using SafeCast for uint256;
+    using TickBitmap for mapping(int16 => uint256);
     using SafeCast for int256;
     using Position for mapping(bytes32 => Position.Info);
     using Position for Position.Info;
@@ -43,6 +47,7 @@ contract CLAMM {
     uint128 public liquidity;
     mapping(int24 => Tick.Info) public ticks;
     mapping(bytes32 => Position.Info) public positions;
+    mapping(int16 => uint256) public tickBitmap;
     uint256 public feeGrowthGlobal0X128;
     uint256 public feeGrowthGlobal1X128;
 
@@ -76,9 +81,8 @@ contract CLAMM {
     {
         position = positions.get(owner, tickLower, tickUpper);
 
-        // TODO fees
-        uint256 _feeGrowthGlobal0X128 = 0;
-        uint256 _feeGrowthGlobal1X128 = 0;
+        uint256 _feeGrowthGlobal0X128 = feeGrowthGlobal0X128;
+        uint256 _feeGrowthGlobal1X128 = feeGrowthGlobal1X128;
 
         bool flippedLower;
         bool flippedUpper;
@@ -97,8 +101,17 @@ contract CLAMM {
             );
         }
 
-        // TODO fees
-        position.update(liquidityDelta, 0, 0);
+        if (flippedLower) {
+            tickBitmap.flipTick(tickLower, tickSpacing);
+        }
+        if (flippedUpper) {
+            tickBitmap.flipTick(tickUpper, tickSpacing);
+        }
+
+        (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) =
+            ticks.getFeeGrowthInside(tickLower, tickUpper, tick, _feeGrowthGlobal0X128, _feeGrowthGlobal1X128);
+
+        position.update(liquidityDelta, feeGrowthInside0X128, feeGrowthInside1X128);
 
         if (liquidityDelta < 0) {
             if (flippedLower) {
@@ -279,7 +292,73 @@ contract CLAMM {
             liquidity: cache.liquidityStart
         });
 
-        while (true) {}
+        while (state.amountSpecifiedRemaining != 0 && state.sqrtPriceX96 != sqrtPriceLimitX96) {
+            StepComputations memory step;
+
+            step.sqrtPriceStartX96 = state.sqrtPriceX96;
+
+            (step.tickNext, step.initialized) =
+                tickBitmap.nextInitializedTickWithinOneWord(state.tick, tickSpacing, zeroForOne);
+
+            if (step.tickNext < TickMath.MIN_TICK) {
+                step.tickNext = TickMath.MIN_TICK;
+            } else if (step.tickNext > TickMath.MAX_TICK) {
+                step.tickNext = TickMath.MAX_TICK;
+            }
+
+            step.sqrtPriceNextX96 = TickMath.getSqrtRatioAtTick(step.tickNext);
+
+            (state.sqrtPriceX96, step.amountIn, step.amountOut, step.feeAmount) = SwapMath.computeSwapStep(
+                state.sqrtPriceX96,
+                (zeroForOne ? step.sqrtPriceNextX96 < sqrtPriceLimitX96 : step.sqrtPriceNextX96 > sqrtPriceLimitX96)
+                    ? sqrtPriceLimitX96
+                    : step.sqrtPriceNextX96,
+                state.liquidity,
+                state.amountSpecifiedRemaining,
+                fee
+            );
+
+            if (exactInput) {
+                // Decreases to 0
+                state.amountSpecifiedRemaining -= (step.amountIn + step.feeAmount).toInt256();
+                state.amountCalculated -= step.amountOut.toInt256();
+            } else {
+                // Increases to 0
+                state.amountSpecifiedRemaining += step.amountOut.toInt256();
+                state.amountCalculated += (step.amountIn + step.feeAmount).toInt256();
+            }
+
+            if (state.liquidity > 0) {
+                // fee growth += fee amount * (1 << 128) / liquidity
+                state.feeGrowthGlobalX128 += FullMath.mulDiv(step.feeAmount, FixedPoint128.Q128, state.liquidity);
+            }
+
+            if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
+                if (step.initialized) {
+                    int128 liquidityNet = ticks.cross(
+                        step.tickNext,
+                        zeroForOne ? state.feeGrowthGlobalX128 : feeGrowthGlobal0X128,
+                        zeroForOne ? feeGrowthGlobal1X128 : state.feeGrowthGlobalX128
+                    );
+
+                    if (zeroForOne) {
+                        liquidityNet = -liquidityNet;
+                    }
+
+                    state.liquidity = liquidityNet < 0
+                        ? state.liquidity - uint128(-liquidityNet)
+                        : state.liquidity + uint128(liquidityNet);
+                }
+                // zeroForOne = true --> tickNext <= state.tick
+                // if tickNext = state.tick --> nextInitializedTick = tickNext, so -1 to get next tick
+                // if tickNext < state.tick --> nextInitializedTick = tickNext, so -1 to get next tick
+                state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext;
+            } else if (state.sqrtPriceX96 != step.sqrtPriceStartX96) {
+                // state.sqrtPriceX96 is still in between 2 initialized ticks
+                // Recompute tick
+                state.tick = TickMath.getTickAtSqrtRatio(state.sqrtPriceX96);
+            }
+        }
 
         if (state.tick != slot0Start.tick) {
             (slot0.sqrtPriceX96, slot0.tick) = (state.sqrtPriceX96, state.tick);
@@ -300,5 +379,17 @@ contract CLAMM {
         (amount0, amount1) = zeroForOne == exactInput
             ? (amountSpecified - state.amountSpecifiedRemaining, state.amountCalculated)
             : (state.amountCalculated, amountSpecified - state.amountSpecifiedRemaining);
+
+        if (zeroForOne) {
+            if (amount1 < 0) {
+                IERC20(token1).transfer(recipient, uint256(-amount1));
+                IERC20(token0).transferFrom(msg.sender, address(this), uint256(amount0));
+            }
+        } else {
+            if (amount0 < 0) {
+                IERC20(token0).transfer(recipient, uint256(-amount0));
+                IERC20(token1).transferFrom(msg.sender, address(this), uint256(amount1));
+            }
+        }
     }
 }
